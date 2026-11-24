@@ -1,3 +1,12 @@
 numpy==1.26.4
 sounddevice==0.4.7
 SoundCard==0.4.3
+fastapi==0.115.12
+uvicorn[standard]==0.34.0
+faster-whisper==1.1.1
+pyannote.audio==3.3.2
+streamlit==1.44.1
+websocket-client==1.8.0
+python-docx==1.1.2
+reportlab==4.2.5
+httpx==0.28.1

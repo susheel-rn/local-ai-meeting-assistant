@@ -73,13 +73,19 @@ class AudioCapture:
         self._writer_queues: dict[str, queue.Queue[AudioChunk]] = {}
         self._writer_stop = threading.Event()
         self._stop_event = threading.Event()
+        self._system_stop_event = threading.Event()
         self._paused = threading.Event()
         self._system_ready = threading.Event()
         self._system_error: Exception | None = None
+        self._system_active = False
         self._start_time: float | None = None
+        self._paused_total = 0.0
+        self._pause_started: float | None = None
         self._running = False
         self._lock = threading.RLock()
         self.recording_paths: dict[str, Path] = {}
+        self.dropped_chunks = {"microphone": 0, "system": 0}
+        self.dropped_recording_chunks = {"microphone": 0, "system": 0}
 
     @property
     def is_running(self) -> bool:
@@ -133,71 +139,90 @@ class AudioCapture:
             if self._running:
                 raise RuntimeError("Audio capture is already running")
             self._stop_event.clear()
+            self._system_stop_event.clear()
             self._writer_stop.clear()
             self._paused.clear()
             self._system_ready.clear()
             self._system_error = None
+            self._system_active = False
+            self._paused_total = 0.0
+            self._pause_started = None
+            self._clear_queue(self.microphone_queue)
+            self._clear_queue(self.system_audio_queue)
             self._start_time = time.monotonic()
             self._running = True
             self.recording_paths = {}
             self._writer_threads = []
             self._writer_queues = {}
 
-        if self.record_audio:
-            self._start_writers()
-
         failures: list[str] = []
-        if self.config.audio_capture_microphone:
-            try:
-                sd = self._get_sounddevice()
-                self._microphone_stream = sd.InputStream(
-                    samplerate=self.config.audio_sample_rate,
-                    channels=1,
-                    dtype="float32",
-                    device=self.microphone_device,
-                    callback=self._microphone_callback,
-                )
-                self._microphone_stream.start()
-                logger.info("Microphone capture started")
-            except Exception as exc:
-                failures.append(f"microphone: {exc}")
-                logger.exception("Microphone capture could not be started")
-                self._microphone_stream = None
+        try:
+            if self.record_audio:
+                self._start_writers()
 
-        if self.config.audio_capture_system:
-            try:
-                self._system_microphone = self._get_loopback_microphone()
-                self._system_thread = threading.Thread(
-                    target=self._capture_system_audio,
-                    name="system-audio-capture",
-                    daemon=True,
-                )
-                self._system_thread.start()
-                if not self._system_ready.wait(timeout=5):
-                    raise RuntimeError("Timed out while opening system-audio capture")
-                if self._system_error is not None:
-                    raise RuntimeError(str(self._system_error)) from self._system_error
-                logger.info("System-audio loopback capture started")
-            except Exception as exc:
-                failures.append(f"system audio: {exc}")
-                logger.exception("System-audio capture could not be started")
+            if self.config.audio_capture_microphone:
+                try:
+                    sd = self._get_sounddevice()
+                    self._microphone_stream = sd.InputStream(
+                        samplerate=self.config.audio_sample_rate,
+                        channels=1,
+                        dtype="float32",
+                        device=self.microphone_device,
+                        callback=self._microphone_callback,
+                    )
+                    self._microphone_stream.start()
+                    logger.info("Microphone capture started")
+                except Exception as exc:
+                    failures.append(f"microphone: {exc}")
+                    logger.exception("Microphone capture could not be started")
+                    self._microphone_stream = None
 
-        if not self._has_active_source():
+            if self.config.audio_capture_system:
+                try:
+                    self._system_microphone = self._get_loopback_microphone()
+                    self._system_thread = threading.Thread(
+                        target=self._capture_system_audio,
+                        name="system-audio-capture",
+                        daemon=True,
+                    )
+                    self._system_thread.start()
+                    if not self._system_ready.wait(timeout=5):
+                        self._system_stop_event.set()
+                        self._system_thread.join(timeout=5)
+                        raise RuntimeError("Timed out while opening system-audio capture")
+                    if self._system_error is not None:
+                        raise RuntimeError(str(self._system_error)) from self._system_error
+                    logger.info("System-audio loopback capture started")
+                except Exception as exc:
+                    failures.append(f"system audio: {exc}")
+                    logger.exception("System-audio capture could not be started")
+
+            if not self._has_active_source():
+                raise RuntimeError(
+                    "No audio source could be started. " + "; ".join(failures)
+                )
+            return self.recording_paths.copy()
+        except Exception:
             self.stop()
-            raise RuntimeError(
-                "No audio source could be started. " + "; ".join(failures)
-            )
-        return self.recording_paths.copy()
+            raise
 
     def pause(self) -> None:
-        if not self._running:
-            raise RuntimeError("Audio capture is not running")
-        self._paused.set()
+        with self._lock:
+            if not self._running:
+                raise RuntimeError("Audio capture is not running")
+            if not self._paused.is_set():
+                self._pause_started = time.monotonic()
+                self._paused.set()
 
     def resume(self) -> None:
-        if not self._running:
-            raise RuntimeError("Audio capture is not running")
-        self._paused.clear()
+        with self._lock:
+            if not self._running:
+                raise RuntimeError("Audio capture is not running")
+            if self._paused.is_set():
+                if self._pause_started is not None:
+                    self._paused_total += time.monotonic() - self._pause_started
+                self._pause_started = None
+                self._paused.clear()
 
     def stop(self) -> dict[str, Path]:
         """Stop capture and drain queued audio to the optional WAV recordings."""
@@ -206,6 +231,7 @@ class AudioCapture:
                 return self.recording_paths.copy()
             self._running = False
             self._stop_event.set()
+            self._system_stop_event.set()
 
         if self._microphone_stream is not None:
             try:
@@ -241,8 +267,19 @@ class AudioCapture:
 
     def _has_active_source(self) -> bool:
         return self._microphone_stream is not None or (
-            self._system_thread is not None and self._system_thread.is_alive()
+            self._system_thread is not None
+            and self._system_thread.is_alive()
+            and self._system_active
         )
+
+    @staticmethod
+    def _clear_queue(target: queue.Queue) -> None:
+        while True:
+            try:
+                target.get_nowait()
+                target.task_done()
+            except queue.Empty:
+                return
 
     def _get_sounddevice(self) -> Any:
         if self._sounddevice_module is None:
@@ -299,9 +336,10 @@ class AudioCapture:
                 samplerate=self.config.audio_sample_rate, channels=2
             ) as recorder:
                 self._system_ready.set()
-                while not self._stop_event.is_set():
+                self._system_active = True
+                while not self._system_stop_event.is_set():
                     samples = recorder.record(numframes=frames)
-                    if self._paused.is_set() or self._stop_event.is_set():
+                    if self._paused.is_set() or self._system_stop_event.is_set():
                         continue
                     if samples is not None and np.size(samples):
                         self._publish_chunk("system", samples)
@@ -310,16 +348,23 @@ class AudioCapture:
             self._system_ready.set()
             if not self._stop_event.is_set():
                 logger.exception("System-audio capture stopped unexpectedly")
+        finally:
+            self._system_active = False
 
     def _publish_chunk(self, source: str, samples: np.ndarray) -> None:
-        if self._start_time is None:
-            return
+        with self._lock:
+            if self._start_time is None or self._paused.is_set():
+                return
+            timestamp = max(
+                0.0,
+                time.monotonic() - self._start_time - self._paused_total,
+            )
         samples = np.asarray(samples, dtype=np.float32)
         if samples.ndim == 1:
             samples = samples.reshape(-1, 1)
         chunk = AudioChunk(
             source=source,
-            timestamp=max(0.0, time.monotonic() - self._start_time),
+            timestamp=timestamp,
             sample_rate=self.config.audio_sample_rate,
             samples=samples,
         )
@@ -329,6 +374,7 @@ class AudioCapture:
         try:
             target.put_nowait(chunk)
         except queue.Full:
+            self.dropped_chunks[source] += 1
             logger.warning("%s audio queue is full; dropping a chunk", source)
 
         writer_queue = self._writer_queues.get(source)
@@ -336,6 +382,7 @@ class AudioCapture:
             try:
                 writer_queue.put_nowait(chunk)
             except queue.Full:
+                self.dropped_recording_chunks[source] += 1
                 logger.error("%s WAV queue is full; recording chunk was dropped", source)
 
     def _start_writers(self) -> None:
