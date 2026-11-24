@@ -250,59 +250,69 @@ class Database:
         )
 
     def save_summary(self, meeting_id: str, summary: dict[str, Any]) -> None:
-        self.execute(
-            """INSERT INTO meeting_summaries(meeting_id,summary_json,updated_at)
-               VALUES(?,?,?) ON CONFLICT(meeting_id) DO UPDATE SET
-               summary_json=excluded.summary_json,updated_at=excluded.updated_at""",
-            (
-                meeting_id,
-                json.dumps(summary, ensure_ascii=False),
-                datetime.now().astimezone().isoformat(),
-            ),
-        )
-        self.execute("DELETE FROM action_items WHERE meeting_id=?", (meeting_id,))
-        self.execute("DELETE FROM decisions WHERE meeting_id=?", (meeting_id,))
+        summary_json = json.dumps(summary, ensure_ascii=False)
+        updated_at = datetime.now().astimezone().isoformat()
         action_items = summary.get("action_items", [])
         if not isinstance(action_items, list):
             action_items = []
-        for item in action_items:
-            if not isinstance(item, dict) or not item.get("task"):
-                continue
-            self.execute(
-                """INSERT INTO action_items
-                   (id,meeting_id,task,owner,deadline,status,timestamp,created_at)
-                   VALUES(?,?,?,?,?,?,?,?)""",
-                (
-                    item.get("id") or uuid.uuid4().hex,
-                    meeting_id,
-                    item.get("task", ""),
-                    item.get("owner"),
-                    item.get("deadline"),
-                    item.get("status", "open"),
-                    item.get("timestamp"),
-                    datetime.now().astimezone().isoformat(),
-                ),
-            )
         decisions = summary.get("decisions", [])
         if not isinstance(decisions, list):
             decisions = []
-        for item in decisions:
-            if not isinstance(item, (dict, str)):
-                continue
-            text = item if isinstance(item, str) else item.get("text", "")
-            if not text:
-                continue
-            self.execute(
-                "INSERT INTO decisions(id,meeting_id,text,timestamp,created_at) "
-                "VALUES(?,?,?,?,?)",
-                (
-                    uuid.uuid4().hex,
-                    meeting_id,
-                    text,
-                    None if isinstance(item, str) else item.get("timestamp"),
-                    datetime.now().astimezone().isoformat(),
-                ),
-            )
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN")
+                self._connection.execute(
+                    """INSERT INTO meeting_summaries(meeting_id,summary_json,updated_at)
+                       VALUES(?,?,?) ON CONFLICT(meeting_id) DO UPDATE SET
+                       summary_json=excluded.summary_json,updated_at=excluded.updated_at""",
+                    (meeting_id, summary_json, updated_at),
+                )
+                self._connection.execute(
+                    "DELETE FROM action_items WHERE meeting_id=?", (meeting_id,)
+                )
+                self._connection.execute(
+                    "DELETE FROM decisions WHERE meeting_id=?", (meeting_id,)
+                )
+                for item in action_items:
+                    if not isinstance(item, dict) or not item.get("task"):
+                        continue
+                    self._connection.execute(
+                        """INSERT INTO action_items
+                           (id,meeting_id,task,owner,deadline,status,timestamp,created_at)
+                           VALUES(?,?,?,?,?,?,?,?)""",
+                        (
+                            uuid.uuid4().hex,
+                            meeting_id,
+                            item["task"],
+                            item.get("owner"),
+                            item.get("deadline"),
+                            item.get("status", "open"),
+                            item.get("timestamp"),
+                            updated_at,
+                        ),
+                    )
+                for item in decisions:
+                    if not isinstance(item, (dict, str)):
+                        continue
+                    text = item if isinstance(item, str) else item.get("text", "")
+                    if not text:
+                        continue
+                    self._connection.execute(
+                        "INSERT INTO decisions(id,meeting_id,text,timestamp,created_at) "
+                        "VALUES(?,?,?,?,?)",
+                        (
+                            uuid.uuid4().hex,
+                            meeting_id,
+                            text,
+                            None if isinstance(item, str) else item.get("timestamp"),
+                            updated_at,
+                        ),
+                    )
+                self._connection.commit()
+            except (sqlite3.Error, TypeError, ValueError):
+                self._connection.rollback()
+                logger.exception("Could not save meeting summary")
+                raise
 
     def get_summary(self, meeting_id: str) -> dict[str, Any] | None:
         row = self.fetch_one(

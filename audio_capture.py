@@ -352,16 +352,20 @@ class AudioCapture:
             self._system_active = False
 
     def _publish_chunk(self, source: str, samples: np.ndarray) -> None:
+        samples = np.asarray(samples, dtype=np.float32)
+        if samples.ndim == 1:
+            samples = samples.reshape(-1, 1)
+        chunk_duration = samples.shape[0] / self.config.audio_sample_rate
         with self._lock:
             if self._start_time is None or self._paused.is_set():
                 return
             timestamp = max(
                 0.0,
-                time.monotonic() - self._start_time - self._paused_total,
+                time.monotonic()
+                - self._start_time
+                - self._paused_total
+                - chunk_duration,
             )
-        samples = np.asarray(samples, dtype=np.float32)
-        if samples.ndim == 1:
-            samples = samples.reshape(-1, 1)
         chunk = AudioChunk(
             source=source,
             timestamp=timestamp,

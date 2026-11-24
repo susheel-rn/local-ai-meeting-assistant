@@ -6,6 +6,7 @@ import wave
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
@@ -162,6 +163,30 @@ class PersistenceAndTranscriptTests(unittest.TestCase):
                     ("m1",),
                 ),
                 {"owner": "Alex", "deadline": "Friday"},
+            )
+            duplicate_ids = {
+                **summary,
+                "action_items": [
+                    {"id": "shared-id", "task": "First task"},
+                    {"id": "shared-id", "task": "Second task"},
+                ],
+            }
+            reopened.save_summary("m1", duplicate_ids)
+            self.assertEqual(
+                reopened.fetch_one(
+                    "SELECT COUNT(*) AS count FROM action_items WHERE meeting_id=?",
+                    ("m1",),
+                )["count"],
+                2,
+            )
+            with self.assertRaises(TypeError):
+                reopened.save_summary("m1", {"invalid": object()})
+            self.assertEqual(
+                reopened.fetch_one(
+                    "SELECT COUNT(*) AS count FROM action_items WHERE meeting_id=?",
+                    ("m1",),
+                )["count"],
+                2,
             )
             reopened.close()
 
@@ -340,6 +365,25 @@ class MeetingLifecycleTests(unittest.TestCase):
 
 
 class CapturePauseTimestampTests(unittest.TestCase):
+    def test_audio_chunk_timestamp_points_to_chunk_start(self):
+        from audio_capture import AudioCapture
+
+        capture = AudioCapture(
+            config=Settings(
+                audio_sample_rate=16_000,
+                audio_capture_microphone=False,
+                audio_capture_system=False,
+                audio_recordings_enabled=False,
+            )
+        )
+        capture._start_time = 10
+        with patch("audio_capture.time.monotonic", return_value=12):
+            capture._publish_chunk(
+                "microphone", np.ones((1_600, 1), dtype=np.float32)
+            )
+        chunk = capture.get_chunk("microphone", timeout=1)
+        self.assertAlmostEqual(chunk.timestamp, 1.9)
+
     def test_capture_timestamps_exclude_paused_time(self):
         import tempfile
         from types import SimpleNamespace

@@ -96,8 +96,10 @@ ollama serve
 
 If Ollama is already running as a Windows service, the `ollama serve` command
 may report that its port is in use; the service is sufficient. Choose another
-locally installed model by setting `OLLAMA_MODEL`. Summary generation runs at
-meeting end and can be requested again from the dashboard or API. If Ollama is
+locally installed model by setting `OLLAMA_MODEL`. Summary generation is
+scheduled in a background worker after capture ends and can be requested again
+from the dashboard or API. This prevents local LLM inference from blocking
+audio capture or meeting finalization. If Ollama is
 unavailable, capture and transcription continue; summary generation reports an
 error and can be retried later.
 
